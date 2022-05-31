@@ -20,6 +20,7 @@ import json
 from apache_beam.coders import coders
 from apache_beam.options.value_provider import ValueProvider
 from google.cloud import bigquery
+from numpy import source
 from models.execution import DestinationType, Execution, Batch
 from string import Template
 from typing import Any, List, Iterable, Optional, Tuple, Dict
@@ -42,6 +43,12 @@ def _get_bq_location_or_none(bq_location: ValueProvider = None) -> Optional[str]
         return bq_location
     return bq_location.get()
 
+def _get_source_where_or_none(source_metadata: List[any]) -> str:
+    """Passes source's filter condition if any. Otherwise, returns None"""
+    if len(source_metadata) >=3 and source_metadata[2]:
+        return source_metadata[2]
+    return None
+    
 
 class ExecutionCoder(coders.Coder):
     """A custom coder for the Execution class."""
@@ -85,7 +92,8 @@ class BatchesFromExecutions(beam.PTransform):
             bq_location = _get_bq_location_or_none(self._bq_location)
             table_name = execution.source.source_metadata[0] + '.' + execution.source.source_metadata[1]
             table_name = table_name.replace('`', '')
-            query = f"SELECT data.* FROM `{table_name}` AS data"
+            table_where = _get_source_where_or_none(execution.source.source_metadata) or '1=1'
+            query = f"SELECT data.* FROM `{table_name}` AS data WHERE {table_where}"
             logging.getLogger(_LOGGER_NAME).info(f'Reading from table {table_name} for Execution {execution}')
             for row in client.query(query, location=bq_location).result(page_size=_BIGQUERY_PAGE_SIZE):
                 yield execution, _convert_row_to_dict(row)
@@ -102,6 +110,7 @@ class BatchesFromExecutions(beam.PTransform):
             table_name = execution.source.source_metadata[0] + \
                 '.' + execution.source.source_metadata[1]
             table_name = table_name.replace('`', '')
+            table_where = _get_source_where_or_none(execution.source.source_metadata) or '1=1'
             uploaded_table_name = self._bq_ops_dataset.get() + \
                 '.' + execution.source.source_metadata[1] + \
                 "_uploaded"
@@ -118,7 +127,7 @@ class BatchesFromExecutions(beam.PTransform):
             client.query(create_table_query_ready, location=bq_location).result()
 
             join_query_ready = \
-                Template(self._join_query).substitute(table_name=table_name, uploaded_table_name=uploaded_table_name)
+                Template(self._join_query).substitute(table_name=table_name, uploaded_table_name=uploaded_table_name,  table_where=table_where)
 
             logging.getLogger(_LOGGER_NAME).info(
                 f'Reading from table {table_name} for Execution {execution}')
@@ -173,7 +182,8 @@ class BatchesFromExecutions(beam.PTransform):
                              OPTIONS(partition_expiration_days=15)",
                 "SELECT data.* FROM `$table_name` AS data \
                                LEFT JOIN $uploaded_table_name AS uploaded USING(uuid) \
-                               WHERE uploaded.uuid IS NULL;"
+                               WHERE uploaded.uuid IS NULL \
+                               AND ($table_where);"
                 )
         if self._transactional_type == TransactionalType.GCLID_TIME:
             return self._ExecutionIntoBigQueryRequestTransactional(
@@ -187,7 +197,8 @@ class BatchesFromExecutions(beam.PTransform):
                              OPTIONS(partition_expiration_days=15)",
                 "SELECT data.* FROM `$table_name` AS data \
                                LEFT JOIN $uploaded_table_name AS uploaded USING(gclid, time) \
-                               WHERE uploaded.gclid IS NULL;"
+                               WHERE uploaded.gclid IS NULL \
+                               AND ($table_where);"
             )
         return self._ExecutionIntoBigQueryRequest(self._bq_location)
 
